@@ -1,8 +1,5 @@
-setuptools>=65.5.1  # Ensure the latest version
-wheel>=0.41.2       # Add wheel to avoid build issues
 streamlit==1.25.0
 langchain==0.0.307
 openai==0.27.8
-sentence-transformers==2.2.2
 numpy==1.24.2
 pickle-mixin
