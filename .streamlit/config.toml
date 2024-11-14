@@ -1,0 +1,5 @@
+[server]
+headless = true
+
+[runner]
+install_wheels = true
