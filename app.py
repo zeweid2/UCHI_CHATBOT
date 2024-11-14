@@ -1,9 +1,15 @@
-from langchain_community.retrievers.document_compressors import EmbeddingsFilter
+
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.document_transformers import (
     LongContextReorder,
     EmbeddingsRedundantFilter,
 )
+from langchain.retrievers.document_compressors import (
+    EmbeddingsFilter,
+    DocumentCompressorPipeline,
+)
+
+
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
