@@ -1,44 +1,34 @@
 
-from langchain_community.retrievers import BM25Retriever
-from langchain_community.document_transformers import (
-    LongContextReorder,
-    EmbeddingsRedundantFilter,
-)
-from langchain.retrievers.document_compressors import (
-    EmbeddingsFilter,
-    DocumentCompressorPipeline,
-)
-
-
+import os
+import streamlit as st
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.chat_models import ChatOpenAI
+import numpy as np
+from langchain.document_transformers import TransformerDocumentLoader
 from langchain.retrievers import ContextualCompressionRetriever
-from langchain_core.documents import Document
-from langchain_core.retrievers import BaseRetriever
-from langchain.retrievers.document_compressors import DocumentCompressorPipeline
-
-# For the reranker
 from sentence_transformers import CrossEncoder
 
-# Replace the CrossEncoderReranker initialization with this:
+# Load preprocessed data
+if os.path.exists('processed_data.pkl'):
+    with open('processed_data.pkl', 'rb') as f:
+        preprocessed_data = pickle.load(f)
+else:
+    st.error("Preprocessed data not found. Please run preprocess.py first.")
+    st.stop()
+
+# Initialize reranker
 def initialize_reranker():
-    """Initialize the cross-encoder reranker"""
     try:
         model = CrossEncoder("BAAI/bge-reranker-base")
         
-        def rerank_documents(documents: List[Document], query: str) -> List[Document]:
+        def rerank_documents(documents, query):
             if not documents:
                 return []
             
-            # Prepare document-query pairs
             pairs = [[query, doc.page_content] for doc in documents]
-            
-            # Get scores from the model
             scores = model.predict(pairs)
-            
-            # Sort documents by score
             scored_documents = list(zip(documents, scores))
             scored_documents.sort(key=lambda x: x[1], reverse=True)
-            
-            # Return top 3 documents
             return [doc for doc, score in scored_documents[:3]]
         
         return rerank_documents
@@ -46,38 +36,30 @@ def initialize_reranker():
         st.error(f"Error initializing reranker: {str(e)}")
         return None
 
-# Then modify the find_relevant_context function to use the new reranker:
-def find_relevant_context(query: str, preprocessed_data: dict, k: int = 5) -> str:
-    """Find most relevant texts using cosine similarity and reranking"""
-    # Get query embedding
+reranker = initialize_reranker()
+
+def find_relevant_context(query, preprocessed_data, k=5):
     embeddings = OpenAIEmbeddings()
     query_embedding = embeddings.embed_query(query)
     
-    # Calculate initial similarities
     similarities = [
         np.dot(query_embedding, doc_embedding) / 
         (np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding))
         for doc_embedding in preprocessed_data['embeddings']
     ]
     
-    # Get top k most similar texts
     top_k_indices = np.argsort(similarities)[-k:][::-1]
     candidate_texts = [preprocessed_data['texts'][i] for i in top_k_indices]
     
-    # Rerank if reranker is available
-    reranker = st.session_state.reranker
     if reranker:
-        # Convert texts to Documents
         docs = [Document(page_content=text) for text in candidate_texts]
-        
-        # Rerank
         reranked_docs = reranker(docs, query)
         relevant_texts = [doc.page_content for doc in reranked_docs]
     else:
-        # If reranker isn't available, just use top 3 from initial ranking
         relevant_texts = candidate_texts[:3]
     
     return "\n\n".join(relevant_texts)
+    
 # Updated prompt template
 PROMPT_TEMPLATE = """Given the context below, please provide an accurate and detailed response to the user's inquiry about the MS in Applied Data Science program at the University of Chicago.
 Respond with a JSON object (not in a code block) in the following format:
