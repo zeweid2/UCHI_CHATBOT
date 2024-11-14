@@ -1,8 +1,17 @@
 import streamlit as st
 from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CohereRerank
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.retrievers.document_compressors import EmbeddingsFilter
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers.document_compressors import DocumentCompressorPipeline
+from langchain.retrievers.document_compressors.cross_encoder_reranker import CrossEncoderReranker
 import pickle
 import os
 import numpy as np
+import json
 from typing import List
 
 # Page config
@@ -19,6 +28,10 @@ if 'api_key' not in st.session_state:
     st.session_state.api_key = None
 if 'preprocessed_data' not in st.session_state:
     st.session_state.preprocessed_data = None
+if 'reranker' not in st.session_state:
+    st.session_state.reranker = None
+if 'expanded_messages' not in st.session_state:
+    st.session_state.expanded_messages = set()
 
 @st.cache_resource
 def load_preprocessed_data():
@@ -30,33 +43,122 @@ def load_preprocessed_data():
         st.error(f"Error loading preprocessed data: {str(e)}")
         return None
 
-def find_relevant_context(query: str, preprocessed_data: dict, k: int = 3) -> str:
-    """Find most relevant texts using cosine similarity"""
-    from langchain_openai import OpenAIEmbeddings
-    
+@st.cache_resource
+def initialize_reranker():
+    """Initialize the cross-encoder reranker"""
+    try:
+        from sentence_transformers import CrossEncoder
+        model = CrossEncoder("BAAI/bge-reranker-base")
+        return CrossEncoderReranker(model=model, top_n=3)
+    except Exception as e:
+        st.error(f"Error initializing reranker: {str(e)}")
+        return None
+
+def find_relevant_context(query: str, preprocessed_data: dict, k: int = 5) -> str:
+    """Find most relevant texts using cosine similarity and reranking"""
     # Get query embedding
     embeddings = OpenAIEmbeddings()
     query_embedding = embeddings.embed_query(query)
     
-    # Calculate similarities
+    # Calculate initial similarities
     similarities = [
         np.dot(query_embedding, doc_embedding) / 
         (np.linalg.norm(query_embedding) * np.linalg.norm(doc_embedding))
         for doc_embedding in preprocessed_data['embeddings']
     ]
     
-    # Get top k most similar texts
+    # Get top k most similar texts (getting more than needed for reranking)
     top_k_indices = np.argsort(similarities)[-k:][::-1]
-    relevant_texts = [preprocessed_data['texts'][i] for i in top_k_indices]
+    candidate_texts = [preprocessed_data['texts'][i] for i in top_k_indices]
+    
+    # Rerank the candidates if reranker is available
+    if st.session_state.reranker:
+        # Prepare documents for reranking
+        from langchain_core.documents import Document
+        docs = [Document(page_content=text) for text in candidate_texts]
+        
+        # Rerank the documents
+        reranked_docs = st.session_state.reranker.compress_documents(docs, query)
+        relevant_texts = [doc.page_content for doc in reranked_docs]
+    else:
+        # If reranker isn't available, just use top 3 from initial ranking
+        relevant_texts = candidate_texts[:3]
     
     return "\n\n".join(relevant_texts)
 
-# Your custom prompt template
-PROMPT_TEMPLATE = """Please provide detail in your answer. If applicable, you may provide an URL relavent to the question asked. Answer the question based on the following context:
-{context}
-
+# Updated prompt template
+PROMPT_TEMPLATE = """Given the context below, please provide an accurate and detailed response to the user's inquiry about the MS in Applied Data Science program at the University of Chicago.
+Respond with a JSON object (not in a code block) in the following format:
+{{
+    "answer": "detailed answer using only information from the context",
+    "confidence": "high/medium/low, based on how thoroughly the context supports your answer",
+    "reasoning": "concise explanation of how the context informs your answer"
+}}
+If the context does not contain enough information, respond with:
+{{
+    "answer": "Cannot be answered from the given context",
+    "confidence": "low",
+    "reasoning": "The provided context lacks sufficient details to answer this inquiry"
+}}
+Context: {context}
 Question: {question}
+Guidelines:
+1. Use only information from the context provided.
+2. Craft a detailed response that addresses the inquiry directly.
+3. Use bullet points for distinct points if applicable.
+4. Include a relevant URL if it directly supports the answer.
+5. Assign confidence based on the relevance and completeness of the context.
+6. Briefly explain your reasoning, focusing on how the context justifies your answer.
+7. Return ONLY the JSON object without any code block markers or extraneous text.
 """
+
+def format_response(response_text: str) -> dict:
+    """Format and validate the response as JSON"""
+    try:
+        # Parse the response as JSON
+        response_dict = json.loads(response_text)
+        return response_dict
+    except json.JSONDecodeError:
+        # If parsing fails, return an error response
+        return {
+            "answer": "Error processing response",
+            "confidence": "low",
+            "reasoning": "Failed to parse response as JSON"
+        }
+
+def display_json_response(response_dict: dict, message_index: int):
+    """Display the JSON response with expandable details"""
+    # Always display the answer
+    st.write(response_dict["answer"])
+    
+    # Create a unique key for this message's expander
+    expander_key = f"details_{message_index}"
+    
+    # Add a button to show/hide details
+    if st.button("Show Details", key=f"button_{message_index}"):
+        st.session_state.expanded_messages.add(message_index)
+    
+    # If this message is expanded, show the confidence and reasoning
+    if message_index in st.session_state.expanded_messages:
+        st.markdown("---")
+        # Display confidence with appropriate color
+        confidence = response_dict["confidence"].lower()
+        confidence_color = {
+            "high": "green",
+            "medium": "orange",
+            "low": "red"
+        }.get(confidence, "gray")
+        
+        st.markdown(f"**Confidence:** ::{confidence_color}[{confidence}]")
+        
+        # Display reasoning
+        st.markdown("**Reasoning:**")
+        st.write(response_dict["reasoning"])
+        
+        # Add button to hide details
+        if st.button("Hide Details", key=f"hide_{message_index}"):
+            st.session_state.expanded_messages.remove(message_index)
+            st.rerun()
 
 # Main app interface
 st.title("🎓 MADS Program Chat Assistant")
@@ -69,10 +171,11 @@ if not os.path.exists('processed_data.pkl'):
     """)
     st.stop()
 
-# Load preprocessed data
+# Load preprocessed data and initialize reranker
 if st.session_state.preprocessed_data is None:
-    with st.spinner("Loading knowledge base..."):
+    with st.spinner("Loading knowledge base and initializing models..."):
         st.session_state.preprocessed_data = load_preprocessed_data()
+        st.session_state.reranker = initialize_reranker()
         if st.session_state.preprocessed_data is None:
             st.error("Failed to load knowledge base")
             st.stop()
@@ -92,9 +195,12 @@ if not st.session_state.api_key:
 
 else:
     # Display chat messages
-    for message in st.session_state.messages:
+    for i, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
-            st.write(message["content"])
+            if message["role"] == "assistant":
+                display_json_response(message["content"], i)
+            else:
+                st.write(message["content"])
 
     # Chat input
     if question := st.chat_input("Ask about the MADS program"):
@@ -125,11 +231,16 @@ else:
                 )
                 
                 response = chat.predict(prompt)
-                st.write(response)
+                
+                # Parse and format the response
+                response_dict = format_response(response)
+                
+                # Display the formatted response
+                display_json_response(response_dict, len(st.session_state.messages))
                 
                 # Save assistant response
                 st.session_state.messages.append(
-                    {"role": "assistant", "content": response}
+                    {"role": "assistant", "content": response_dict}
                 )
                 
             except Exception as e:
@@ -139,10 +250,12 @@ else:
     with st.sidebar:
         if st.button("Clear Chat"):
             st.session_state.messages = []
+            st.session_state.expanded_messages = set()
             st.rerun()
         if st.button("Reset API Key"):
             st.session_state.api_key = None
             st.session_state.messages = []
+            st.session_state.expanded_messages = set()
             st.rerun()
 
 # Footer
