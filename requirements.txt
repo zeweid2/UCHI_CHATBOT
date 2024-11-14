@@ -2,7 +2,6 @@
 streamlit==1.31.0
 langchain==0.1.0
 langchain-openai==0.0.5
-langchain-community==0.0.16
 langchain-core==0.1.17
 sentence-transformers==2.3.1
 openai==1.12.0
