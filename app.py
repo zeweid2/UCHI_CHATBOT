@@ -1,59 +1,46 @@
-import streamlit as st
-from langchain_openai import ChatOpenAI
-from langchain_openai import OpenAIEmbeddings
-from langchain.retrievers import ContextualCompressionRetriever
-from langchain.retrievers.document_compressors import CohereRerank
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.retrievers.document_compressors import EmbeddingsFilter
+from langchain_community.retrievers.document_compressors import EmbeddingsFilter
 from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers.document_compressors import DocumentCompressorPipeline
-from langchain.retrievers.document_compressors.cross_encoder_reranker import CrossEncoderReranker
-import pickle
-import os
-import numpy as np
-import json
-from typing import List
-
-# Page config
-st.set_page_config(
-    page_title="MADS Program Chat Assistant",
-    page_icon="🎓",
-    layout="wide"
+from langchain_community.document_transformers import (
+    LongContextReorder,
+    EmbeddingsRedundantFilter,
 )
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain.retrievers.document_compressors import DocumentCompressorPipeline
 
-# Initialize session states
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'api_key' not in st.session_state:
-    st.session_state.api_key = None
-if 'preprocessed_data' not in st.session_state:
-    st.session_state.preprocessed_data = None
-if 'reranker' not in st.session_state:
-    st.session_state.reranker = None
-if 'expanded_messages' not in st.session_state:
-    st.session_state.expanded_messages = set()
+# For the reranker
+from sentence_transformers import CrossEncoder
 
-@st.cache_resource
-def load_preprocessed_data():
-    """Load the preprocessed data from pickle file"""
-    try:
-        with open('processed_data.pkl', 'rb') as f:
-            return pickle.load(f)
-    except Exception as e:
-        st.error(f"Error loading preprocessed data: {str(e)}")
-        return None
-
-@st.cache_resource
+# Replace the CrossEncoderReranker initialization with this:
 def initialize_reranker():
     """Initialize the cross-encoder reranker"""
     try:
-        from sentence_transformers import CrossEncoder
         model = CrossEncoder("BAAI/bge-reranker-base")
-        return CrossEncoderReranker(model=model, top_n=3)
+        
+        def rerank_documents(documents: List[Document], query: str) -> List[Document]:
+            if not documents:
+                return []
+            
+            # Prepare document-query pairs
+            pairs = [[query, doc.page_content] for doc in documents]
+            
+            # Get scores from the model
+            scores = model.predict(pairs)
+            
+            # Sort documents by score
+            scored_documents = list(zip(documents, scores))
+            scored_documents.sort(key=lambda x: x[1], reverse=True)
+            
+            # Return top 3 documents
+            return [doc for doc, score in scored_documents[:3]]
+        
+        return rerank_documents
     except Exception as e:
         st.error(f"Error initializing reranker: {str(e)}")
         return None
 
+# Then modify the find_relevant_context function to use the new reranker:
 def find_relevant_context(query: str, preprocessed_data: dict, k: int = 5) -> str:
     """Find most relevant texts using cosine similarity and reranking"""
     # Get query embedding
@@ -67,25 +54,24 @@ def find_relevant_context(query: str, preprocessed_data: dict, k: int = 5) -> st
         for doc_embedding in preprocessed_data['embeddings']
     ]
     
-    # Get top k most similar texts (getting more than needed for reranking)
+    # Get top k most similar texts
     top_k_indices = np.argsort(similarities)[-k:][::-1]
     candidate_texts = [preprocessed_data['texts'][i] for i in top_k_indices]
     
-    # Rerank the candidates if reranker is available
-    if st.session_state.reranker:
-        # Prepare documents for reranking
-        from langchain_core.documents import Document
+    # Rerank if reranker is available
+    reranker = st.session_state.reranker
+    if reranker:
+        # Convert texts to Documents
         docs = [Document(page_content=text) for text in candidate_texts]
         
-        # Rerank the documents
-        reranked_docs = st.session_state.reranker.compress_documents(docs, query)
+        # Rerank
+        reranked_docs = reranker(docs, query)
         relevant_texts = [doc.page_content for doc in reranked_docs]
     else:
         # If reranker isn't available, just use top 3 from initial ranking
         relevant_texts = candidate_texts[:3]
     
     return "\n\n".join(relevant_texts)
-
 # Updated prompt template
 PROMPT_TEMPLATE = """Given the context below, please provide an accurate and detailed response to the user's inquiry about the MS in Applied Data Science program at the University of Chicago.
 Respond with a JSON object (not in a code block) in the following format:
